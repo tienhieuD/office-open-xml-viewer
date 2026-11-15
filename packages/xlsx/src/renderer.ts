@@ -34,7 +34,7 @@ import type {
 import { blipEffectsMayExtendCoverage, blipPixelEffectsKey, imageEffectFrame, stretchedSourceFrame, type BlipEffect, type BlipPixelEffects } from '@silurus/ooxml-core';
 import { usesPathShade, trackPaintPath, currentStrokeBounds, chartImageFillStoreLookup, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
 import { placePhoneticRuns } from './phonetic.js';
-import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, cachedTintedMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
+import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, cachedTintedMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, getConnectorAnchors, drawArrowHead, resolveArrowPaint, lineEndRetract, traceTrimmedPath, tracePresetLeader, EMU_PER_PT, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
 import {
   canvasShapeFontBoxProbe, excelShapeSpacing, officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios,
   type ShapeRunLineRatios,
@@ -4601,7 +4601,10 @@ function renderShapeGroups(
     const { x: x1, y: y1, width: w, height: h } = resolveWorksheetAnchorRect(
       ws, anchor, colAxis, rowAxis, cs,
     );
-    if (w <= 0 || h <= 0) continue;
+    // A straight horizontal / vertical connector spans a zero-height / -width
+    // anchor; it is still a visible line, so only area-less non-lines are skipped.
+    if (w < 0 || h < 0) continue;
+    if ((w === 0 || h === 0) && !anchor.shapes.some(isConnectorShape)) continue;
 
     const logicalCanvasX = scrollAreaX + (x1 - scrollOriginSheetX) - scrollOffsetX;
     const canvasX = sheetAnchoredRectX(logicalCanvasX, w, canvasW, rtl);
@@ -4615,11 +4618,19 @@ function renderShapeGroups(
     if (!effectLeaf && (canvasY + h < scrollAreaY || canvasY > scrollAreaY + scrollAreaH)) continue;
 
     for (const shape of shapes) {
-      const sx = canvasX + shape.x * w;
-      const sy = canvasY + shape.y * h;
-      const sw = shape.w * w;
-      const sh = shape.h * h;
-      if (sw <= 0 || sh <= 0) continue;
+      let sx = canvasX + shape.x * w;
+      let sy = canvasY + shape.y * h;
+      let sw = shape.w * w;
+      let sh = shape.h * h;
+      if (sw < 0 || sh < 0 || ((sw === 0 || sh === 0) && !isConnectorShape(shape))) continue;
+      if (isQuarterTurnedStandaloneConnector(shape)) {
+        // A stand-alone connector fills its anchor, and Excel anchors a shape by
+        // the bounding box of its rotated outline. For a quarter turn that box
+        // has the frame's width and height swapped (§20.1.7.6 `a:xfrm@rot`), so
+        // lay the unrotated frame out transposed about the same centre.
+        [sx, sy] = [sx + (sw - sh) / 2, sy + (sh - sw) / 2];
+        [sw, sh] = [sh, sw];
+      }
       drawShape(ctx, shape, sx, sy, sw, sh, cs, loadedImages, cjkFallback, anchor);
     }
   }
@@ -4707,6 +4718,86 @@ function appendSpreadsheetShapeOutline(
   }
 }
 
+const CONNECTOR_GEOMS = new Set([
+  'line', 'straightconnector1',
+  'bentconnector2', 'bentconnector3', 'bentconnector4', 'bentconnector5',
+  'curvedconnector2', 'curvedconnector3', 'curvedconnector4', 'curvedconnector5',
+]);
+
+function isConnectorShape(shape: ShapeInfo): boolean {
+  return shape.geom?.type === 'preset' && CONNECTOR_GEOMS.has(shape.geom.name.toLowerCase());
+}
+
+/** The parser emits a stand-alone `xdr:cxnSp` as a leaf filling its anchor
+ *  (x=y=0, w=h=1); a connector rotated by 90 or 270 degrees needs its frame
+ *  transposed to fit the anchor's bounding box. */
+function isQuarterTurnedStandaloneConnector(shape: ShapeInfo): boolean {
+  if (!isConnectorShape(shape)) return false;
+  if (shape.x !== 0 || shape.y !== 0 || shape.w !== 1 || shape.h !== 1) return false;
+  const turn = ((shape.rot % 180) + 180) % 180;
+  return Math.abs(turn - 90) < 1e-6;
+}
+
+/** Straight / bent connectors are re-stroked from their vertices, shortened at
+ *  each decorated end (same policy as the PPTX renderer). */
+function isRetractableConnector(geom: string): boolean {
+  return geom === 'line' || geom === 'straightconnector1' || geom.startsWith('bentconnector');
+}
+
+/** Head/tail decorations of a connector-like preset (`xdr:cxnSp` or a line
+ *  `xdr:sp`), or null when the shape carries none. Core measures the sizes. */
+function connectorLineEnds(shape: ShapeInfo): { geom: string; head: number; tail: number } | null {
+  if (shape.geom?.type !== 'preset') return null;
+  const geom = shape.geom.name.toLowerCase();
+  if (!CONNECTOR_GEOMS.has(geom)) return null;
+  const stroke = shapeStroke(shape);
+  if (!stroke) return null;
+  const scale = 1 / EMU_PER_PX;
+  const head = stroke.headEnd && stroke.headEnd.type !== 'none' ? lineEndRetract(stroke.headEnd, stroke, scale, EMU_PER_PT) : 0;
+  const tail = stroke.tailEnd && stroke.tailEnd.type !== 'none' ? lineEndRetract(stroke.tailEnd, stroke, scale, EMU_PER_PT) : 0;
+  const hasHead = !!stroke.headEnd && stroke.headEnd.type !== 'none';
+  const hasTail = !!stroke.tailEnd && stroke.tailEnd.type !== 'none';
+  return hasHead || hasTail ? { geom, head, tail } : null;
+}
+
+/** ECMA-376 §20.1.8.38 `a:headEnd` / `a:tailEnd`: paint the (retracted) leader
+ *  and the arrow decorations in the shape-local frame (0,0)-(sw,sh). */
+function drawConnectorLineEnds(
+  ctx: CanvasRenderingContext2D, shape: ShapeInfo,
+  ends: { geom: string; head: number; tail: number }, sw: number, sh: number,
+): void {
+  const stroke = shapeStroke(shape);
+  if (!stroke || shape.geom.type !== 'preset') return;
+  const scale = 1 / EMU_PER_PX;
+  const name = shape.geom.name;
+  const adj = shape.geom.adj ?? [];
+  const anchors = getConnectorAnchors(name, 0, 0, sw, sh, adj);
+  if (!anchors) return;
+  ctx.save();
+  applyStroke(ctx, stroke, scale);
+  ctx.beginPath();
+  if (isRetractableConnector(ends.geom) && anchors.vertices.length >= 2) {
+    const pts = anchors.vertices;
+    traceTrimmedPath(ctx, (sink) => {
+      sink.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) sink.lineTo(pts[i].x, pts[i].y);
+    }, ends.head, ends.tail);
+    ctx.stroke();
+  } else if (tracePresetLeader(ctx, name, 0, 0, sw, sh, adj, ends.head, ends.tail)) {
+    ctx.stroke();
+  }
+  ctx.restore();
+  const frame = { x: 0, y: 0, w: sw, h: sh };
+  const paint = (end: NonNullable<Stroke['tailEnd']>, tip: { x: number; y: number; angle: number }) => {
+    ctx.save();
+    drawArrowHead(ctx, tip.x, tip.y, tip.angle, end, stroke, scale, EMU_PER_PT,
+      resolveArrowPaint(ctx, stroke, scale, EMU_PER_PT, tip.x, tip.y, tip.angle, end, frame, shape.rot, scale * EMU_PER_PT));
+    ctx.restore();
+  };
+  if (stroke.tailEnd && stroke.tailEnd.type !== 'none') paint(stroke.tailEnd, anchors.end);
+  if (stroke.headEnd && stroke.headEnd.type !== 'none') paint(stroke.headEnd, anchors.start);
+}
+
 function drawShape(
   ctx: CanvasRenderingContext2D,
   shape: ShapeInfo,
@@ -4757,6 +4848,7 @@ function drawShape(
     const applyAndStroke = shape.strokeColor && shape.strokeWidth > 0
       ? () => strokeShapePath(ctx, shape, sw, sh, cs)
       : null;
+    const lineEnds = connectorLineEnds(shape);
     const drawn = renderPresetShape(
       ctx,
       shape.geom.name,
@@ -4770,7 +4862,11 @@ function drawShape(
       // xlsx shapes carry no drop shadow on the body, so there's nothing to
       // clear between the engine's fill and stroke passes.
       () => {},
+      lineEnds && isRetractableConnector(lineEnds.geom) ? { skipTrailingStroke: true } : undefined,
     );
+    if (drawn && lineEnds) {
+      drawConnectorLineEnds(ctx, shape, lineEnds, sw, sh);
+    }
     if (!drawn) {
       ctx.beginPath();
       ctx.rect(0, 0, sw, sh);
